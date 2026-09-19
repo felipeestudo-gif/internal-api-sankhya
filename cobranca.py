@@ -301,6 +301,39 @@ CHEQUES_REGRA AS (
     SELECT STATUS_REGRA, ORIGEM_REGRA, NUFIN, CHEQUE,
            VLRCHEQUE_REGRA, DATACHEQUE_REGRA, ULTIMO_EVENTO_REGRA
     FROM DEV_1657
+),
+/* Renegociações podem gerar novos títulos sem NUNOTA e com CODVEND = 0.
+   Nesse caso, herda o vendedor interno SOMENTE quando todas as origens
+   neutralizadas (RECDESP = 0) da renegociação apontam para o mesmo vendedor
+   interno válido. Se houver mistura ou origem sem vendedor, mantém 0. */
+RENEG_VENDEDOR AS (
+    SELECT
+        F_ORIG.NURENEG,
+        CASE
+            WHEN COUNT(DISTINCT CASE
+                     WHEN NVL(CAB_ORIG.AD_CODVENDINT, 0) > 0
+                      AND VEN_ORIG.AD_VENDINTEXT = 'I'
+                     THEN CAB_ORIG.AD_CODVENDINT
+                 END) = 1
+             AND COUNT(*) = SUM(CASE
+                     WHEN NVL(CAB_ORIG.AD_CODVENDINT, 0) > 0
+                      AND VEN_ORIG.AD_VENDINTEXT = 'I'
+                     THEN 1 ELSE 0
+                 END)
+            THEN MAX(CASE
+                     WHEN NVL(CAB_ORIG.AD_CODVENDINT, 0) > 0
+                      AND VEN_ORIG.AD_VENDINTEXT = 'I'
+                     THEN CAB_ORIG.AD_CODVENDINT
+                 END)
+        END AS CODVENDINT_RENEG
+    FROM TGFFIN F_ORIG
+        LEFT JOIN TGFCAB CAB_ORIG
+               ON CAB_ORIG.NUNOTA = F_ORIG.NUNOTA
+        LEFT JOIN TGFVEN VEN_ORIG
+               ON VEN_ORIG.CODVEND = CAB_ORIG.AD_CODVENDINT
+    WHERE F_ORIG.RECDESP = 0
+      AND F_ORIG.NURENEG IS NOT NULL
+    GROUP BY F_ORIG.NURENEG
 )
 """
 
@@ -310,14 +343,22 @@ DT_EFETIVA = """
 """
 
 # Vendedor efetivo da cobrança:
-# - CODVEND > 0 continua sendo soberano;
-# - somente quando CODVEND é 0/nulo, usa AD_CODVENDINT da venda, se informado.
+# 1) CODVEND > 0 continua sendo soberano;
+# 2) com CODVEND 0/nulo, usa AD_CODVENDINT da venda direta;
+# 3) se a renegociação perdeu a NUNOTA, herda o único vendedor interno comum
+#    às origens neutralizadas da mesma NURENEG; caso ambíguo permanece vendedor 0.
 CODVEND_EFETIVO = """
     CASE
-        WHEN NVL(FIN.CODVEND, 0) = 0
-         AND NVL(CAB.AD_CODVENDINT, 0) > 0
+        WHEN NVL(FIN.CODVEND, 0) > 0
+        THEN FIN.CODVEND
+
+        WHEN NVL(CAB.AD_CODVENDINT, 0) > 0
         THEN CAB.AD_CODVENDINT
-        ELSE NVL(FIN.CODVEND, 0)
+
+        WHEN NVL(RENV.CODVENDINT_RENEG, 0) > 0
+        THEN RENV.CODVENDINT_RENEG
+
+        ELSE 0
     END
 """
 
@@ -326,6 +367,7 @@ JOINS_TITULO = f"""
     FROM TGFFIN FIN
         INNER JOIN TGFPAR PAR  ON PAR.CODPARC      = FIN.CODPARC
         LEFT JOIN TGFCAB CAB   ON CAB.NUNOTA       = FIN.NUNOTA
+        LEFT JOIN RENEG_VENDEDOR RENV ON RENV.NURENEG = FIN.NURENEG
         LEFT JOIN TSICID CID   ON CID.CODCID       = PAR.CODCID
         LEFT JOIN TSIUFS UFS   ON UFS.CODUF        = CID.UF
         LEFT JOIN TGFTIT TIT   ON TIT.CODTIPTIT    = FIN.CODTIPTIT
@@ -2662,8 +2704,10 @@ def painel():
 # quem está FORA do radar da cobrança é o motivo desta tela existir.
 #
 # ⚠️ O vendedor sai do TÍTULO quando FIN.CODVEND > 0. Somente quando ele está
-# zerado/nulo, a cobrança herda TGFCAB.AD_CODVENDINT da venda. O cadastro do
-# cliente (PAR.CODVEND) não participa. Um cliente que comprou com dois vendedores aparece nas duas
+# zerado/nulo, a cobrança herda TGFCAB.AD_CODVENDINT da venda; em título
+# renegociado que perdeu a NUNOTA, herda o vendedor interno apenas se todas as
+# origens da mesma NURENEG tiverem o mesmo vendedor. O cadastro do cliente
+# (PAR.CODVEND) não participa. Um cliente que comprou com dois vendedores aparece nas duas
 # telas, cada uma somando só os títulos dela — por isso o total do cliente aqui
 # pode ser MENOR que o da Visão 360° dele, que mostra tudo. É a leitura certa
 # para "títulos por vendedor" e a mesma que o filtro de vendedor da tela de
